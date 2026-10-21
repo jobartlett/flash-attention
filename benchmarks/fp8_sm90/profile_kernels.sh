@@ -23,7 +23,7 @@ NCU_CLOCKS=${NCU_CLOCKS:-base}
 NCU_KERNEL=${NCU_KERNEL:-regex:[Ff]lash|cutlass|[Cc]ombine}
 mkdir -p "$REPORT_DIR"
 TAG="${LABEL}_${CASE}_${DTYPE}"
-RUN=(python "$HERE/fp8_compare.py" worker --root "$ROOT" --cases "$CASE" --dtypes "$DTYPE")
+RUN=(python3 "$HERE/fp8_compare.py" worker --root "$ROOT" --cases "$CASE" --dtypes "$DTYPE")
 
 # Timeline: the capture range is the cudaProfilerStart/Stop window around the timed loop,
 # so JIT compilation and warmup are excluded.
