@@ -213,23 +213,44 @@ def _tile_size_fwd_sm90_native_fp8(
     return 128, 64
 
 
-def _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v):
-    """Whether two single-warpgroup native FP8 CTAs (tile_m 64, hdim_v <= 128) fit on one SM,
-    i.e. a 2-stage pipeline fits in half of the SM's shared memory.
+def _fits_two_ctas_sm90(tile_m, tile_n, head_dim, head_dim_v, native_fp8, mma_pv_is_rs=True):
+    """Whether two single-warpgroup CTAs (tile_m 64, hdim_v <= 128) fit on one SM, i.e. a
+    2-stage pipeline fits in half of the SM's shared memory.
 
-    Shared memory per CTA: per stage K + V as loaded + the transposed V
-    (tile_n x (hdim + 2 * hdim_v) bytes), plus the Q / O tile and 1 KB of barriers. An H100 / H200
-    SM has 228 KB of shared memory and reserves 1 KB per CTA (CUTLASS's get_smem_capacity_in_bytes
-    gives the 227 KB per-CTA maximum, not the per-SM total).
+    Shared memory per CTA, per stage: native FP8 holds K + V as loaded + the transposed V
+    (tile_n x (hdim + 2 * hdim_v) bytes); 16-bit holds K + V (2 * tile_n x (hdim + hdim_v)
+    bytes). Plus the Q / O tile, sP when PV reads P from shared memory, and 1 KB of barriers.
+    An H100 / H200 SM has 228 KB of shared memory and reserves 1 KB per CTA (CUTLASS's
+    get_smem_capacity_in_bytes gives the 227 KB per-CTA maximum, not the per-SM total).
     """
     smem_per_sm, reserved_per_cta, num_stages = 228 * 1024, 1024, 2
-    smem_bytes = (
-        max(tile_m * head_dim, 2 * tile_m * head_dim_v)
-        + 1024
-        + num_stages * tile_n * (head_dim + 2 * head_dim_v)
-    )
+    if native_fp8:
+        fixed_bytes = max(tile_m * head_dim, 2 * tile_m * head_dim_v)
+        stage_bytes = tile_n * (head_dim + 2 * head_dim_v)
+    else:
+        fixed_bytes = 2 * tile_m * max(head_dim, head_dim_v)
+        if not mma_pv_is_rs:
+            fixed_bytes += 2 * tile_m * tile_n
+        stage_bytes = 2 * tile_n * (head_dim + head_dim_v)
+    smem_bytes = fixed_bytes + 1024 + num_stages * stage_bytes
     budget = smem_per_sm // 2 - reserved_per_cta - 1024
     return tile_m == 64 and head_dim_v <= 128 and smem_bytes <= budget
+
+
+def _tile_size_fwd_sm90_16bit_decode(head_dim, head_dim_v, rows_per_kv_head):
+    """Return (tile_m, tile_n) for 16-bit SM90 short decode, or None for other shapes.
+
+    At most 64 packed query rows share a KV head, so a 64-row tile wastes less of the QK and
+    PV GEMMs than the 128/192-row defaults. tile_n is the largest that lets two CTAs share an
+    SM when hdim_v <= 128, matching the native FP8 decode tiles' use of the second slot.
+    """
+    if rows_per_kv_head > 64 or max(head_dim, head_dim_v) > 256:
+        return None
+    if head_dim_v <= 128:
+        for tile_n in (128, 96):
+            if _fits_two_ctas_sm90(64, tile_n, head_dim, head_dim_v, native_fp8=False):
+                return 64, tile_n
+    return 64, 64
 
 
 @dataclass(frozen=True)
@@ -522,8 +543,10 @@ def _get_fwd_config(
     mma_pv_is_rs: Optional[bool] = None,
     intra_wg_overlap: Optional[bool] = None,
     native_fp8: bool = False,
+    sm90_16bit_decode_tuning: bool = False,
 ) -> FwdConfig:
     auto_splits = num_splits < 1
+    sm90_decode_tuning = arch // 10 == 9 and (native_fp8 or sm90_16bit_decode_tuning)
     if seqlen_q is None:
         seqlen_q = max_seqlen_q
 
@@ -562,9 +585,9 @@ def _get_fwd_config(
     # Keys one M tile can touch: the full KV for global attention, else the window span.
     if not local:
         seqlen_k_loaded = max_seqlen_k
-    elif native_fp8:
-        # SM90 native FP8 counts the real window: the `or` below treats a right window of 0 as
-        # unbounded (kept for the other paths so their split choice does not change).
+    elif sm90_decode_tuning:
+        # SM90 decode tuning counts the real window: the `or` below treats a right window of 0
+        # as unbounded (kept for the other paths so their split choice does not change).
         right = window_size_right if window_size_right is not None else max_seqlen_k
         left = window_size_left if window_size_left is not None else max_seqlen_k
         seqlen_k_loaded = max(0, min(max_seqlen_k, right + left + 1 + tile_m))
@@ -606,16 +629,18 @@ def _get_fwd_config(
         else:
             num_splits = 1
 
-    # SM90 native FP8: static splits own whole N tiles, so splits beyond the tile count
+    # SM90 decode tuning: static splits own whole N tiles, so splits beyond the tile count
     # are empty, and once the M blocks fill the SMs more splits only add FP32 partials.
     # With the auto heuristic, splits also fill the second CTA slot when two CTAs fit per SM.
-    if native_fp8:
+    if sm90_decode_tuning:
         if num_SMs is None:
             num_SMs = get_num_sms_for_selection(device.index, arch)
         mblocks = max(1, total_mblocks)
         if num_splits > 1:
             num_splits = min(num_splits, max(1, num_n_blocks), max(1, num_SMs // mblocks))
-        if auto_splits and _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v):
+        if auto_splits and _fits_two_ctas_sm90(
+            tile_m, tile_n, head_dim, head_dim_v, native_fp8, mma_pv_is_rs
+        ):
             num_splits = max(num_splits, min(2 * num_SMs // mblocks, num_n_blocks // 4, 128))
 
     return FwdConfig(tile_m, tile_n, mma_pv_is_rs, intra_wg_overlap, q_stage, num_splits)
@@ -1169,6 +1194,22 @@ def _flash_attn_fwd(
         # Match FA3's paged non-TMA launch policy: K/V without TMA use the PackGQA Q/O copies.
         if page_table is not None and page_size != tile_mn[1]:
             pack_gqa = True
+    # SM90 16-bit Q/K/V shares native FP8's decode launch tuning: window-aware splits, 64-row
+    # decode tiles, two CTAs per SM, the direct decode grid, and page-sized TMA boxes.
+    sm90_16bit_decode_tuning = (
+        arch // 10 == 9
+        and not native_fp8
+        and not fp8_kv_dequant
+        and q is not None
+        and k is not None
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and qv is None
+        and block_sparse_tensors is None
+    )
+    if sm90_16bit_decode_tuning and tile_mn is None and isinstance(max_seqlen_q, int):
+        tile_mn = _tile_size_fwd_sm90_16bit_decode(
+            head_dim, head_dim_v, max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
+        )
     fwd_cfg = _get_fwd_config(
         arch=arch,
         head_dim=head_dim,
@@ -1191,15 +1232,17 @@ def _flash_attn_fwd(
         mma_pv_is_rs=mma_pv_is_rs,
         intra_wg_overlap=intra_wg_overlap,
         native_fp8=native_fp8,
+        sm90_16bit_decode_tuning=sm90_16bit_decode_tuning,
     )
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
-    # SM90 native FP8 paged KV whose page size differs from tile_n: load each KV tile as
+    sm90_decode_tuning = native_fp8 or sm90_16bit_decode_tuning
+    # SM90 paged KV whose page size differs from tile_n: load each KV tile as
     # tile_n / box_n page-aligned TMA boxes instead of falling back to cp.async.
-    native_fp8_tma_box_n = None
-    if native_fp8 and page_table is not None and page_size != tile_n:
+    sm90_tma_box_n = None
+    if sm90_decode_tuning and page_table is not None and page_size != tile_n:
         box_n = math.gcd(page_size, tile_n)
         if box_n % 8 == 0 and tile_n // box_n <= 32:
-            native_fp8_tma_box_n = box_n
+            sm90_tma_box_n = box_n
     q_stage = fwd_cfg.q_stage
     num_splits = fwd_cfg.num_splits
     mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
@@ -1663,7 +1706,7 @@ def _flash_attn_fwd(
         pack_gqa,
         arch,
         page_size not in [None, tile_n],  # paged KV non-TMA
-        native_fp8_tma_box_n,  # native FP8 paged KV as page-sized TMA boxes
+        sm90_tma_box_n,  # SM90 paged KV as page-sized TMA boxes
         use_2cta_instrs,
         q_subtile_factor,
         kv_subtile_factor,
@@ -1699,18 +1742,18 @@ def _flash_attn_fwd(
         # the decode kernel is a different class with a different grid and smem plan
         decode_splits,
     )
-    # SM90 native FP8 launch-shape choices; each one is part of the compile key.
-    native_fp8_one_m_block_per_batch = (
-        native_fp8
+    # SM90 decode-tuning launch-shape choices; each one is part of the compile key.
+    sm90_one_m_block_per_batch = (
+        sm90_decode_tuning
         and cu_seqlens_q is not None
         and (seqused_q is None)
         and (not use_block_sparsity)
         and isinstance(max_seqlen_q, int)
         and (max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1) <= tile_m)
     )
-    native_fp8_direct_3d_grid = native_fp8_one_m_block_per_batch and batch_size <= 65535
-    native_fp8_ctas_per_sm = 1
-    if native_fp8:
+    sm90_direct_3d_grid = sm90_one_m_block_per_batch and batch_size <= 65535
+    sm90_ctas_per_sm = 1
+    if sm90_decode_tuning:
         seqlen_q_rows = (max_seqlen_q if isinstance(max_seqlen_q, int) else total_q) * (
             qhead_per_kvhead if pack_gqa else 1
         )
@@ -1721,16 +1764,18 @@ def _flash_attn_fwd(
             * max(1, num_splits)
         )
         # Two CTAs per SM only pay off when the grid exceeds one wave.
-        native_fp8_ctas_per_sm = (
+        sm90_ctas_per_sm = (
             2
             if num_ctas > get_num_sms_for_selection(device.index, arch)
-            and _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v)
+            and _fits_two_ctas_sm90(
+                tile_m, tile_n, head_dim, head_dim_v, native_fp8, mma_pv_is_rs
+            )
             else 1
         )
         compile_key += (
-            native_fp8_one_m_block_per_batch,
-            native_fp8_direct_3d_grid,
-            native_fp8_ctas_per_sm,
+            sm90_one_m_block_per_batch,
+            sm90_direct_3d_grid,
+            sm90_ctas_per_sm,
         )
     if use_dedicated_hd256_kernel:
         compile_key += (
@@ -1880,7 +1925,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
-                paged_kv_non_tma=page_size not in [None, tile_n] and native_fp8_tma_box_n is None,
+                paged_kv_non_tma=page_size not in [None, tile_n] and sm90_tma_box_n is None,
                 # SplitKV: forward writes FP32 partials, combine does the fold.
                 output_quant_key=output_quant_key if not is_split_kv else None,
                 kv_dtype=kv_dtype,  # K/V storage dtype (fp8)
@@ -1889,9 +1934,9 @@ def _flash_attn_fwd(
                 native_fp8_o_dtype=(
                     torch2cute_dtype_map[out_torch_dtype] if native_fp8 else None
                 ),
-                native_fp8_tma_box_n=native_fp8_tma_box_n,
-                native_fp8_direct_3d_grid=native_fp8_direct_3d_grid,
-                native_fp8_ctas_per_sm=native_fp8_ctas_per_sm,
+                tma_box_n=sm90_tma_box_n,
+                direct_3d_grid=sm90_direct_3d_grid,
+                ctas_per_sm=sm90_ctas_per_sm,
             )
         elif arch // 10 in [10, 11]:
             if output_quant_key is not None:
