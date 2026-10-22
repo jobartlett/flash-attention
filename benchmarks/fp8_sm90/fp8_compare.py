@@ -13,6 +13,10 @@ reference therefore scores every variant.
   # full comparison (spawns one worker per tree, prints tables)
   python benchmarks/fp8_sm90/fp8_compare.py compare --orig . --accel ../fa4-accel
 
+  # also time the 16-bit kernels with the same decode tuning (branch fa4-sm90-16bit-decode-opts)
+  python benchmarks/fp8_sm90/fp8_compare.py compare --orig . --accel b=../fa4-accel \
+      --tuned16 b16opt=../fa4-16bit
+
   # one tree / case / dtype, e.g. under nsys or ncu
   python benchmarks/fp8_sm90/fp8_compare.py worker --root ../fa4-accel \
       --cases gemma-swa-p16 --dtypes fp8 --profile-iters 20
@@ -50,6 +54,7 @@ CASES = {
         # Gemma-4-31B TP4 SWA verify step (MTP=3): the customer shape.
         Case("gemma-swa-p64", 256, 8, 4, 4, 4, 28216, 1024, 64),
         Case("gemma-swa-p16", 256, 8, 4, 4, 4, 28216, 1024, 16),
+        Case("gemma-swa-b16-p16", 256, 8, 4, 16, 4, 28216, 1024, 16),
         # Same shape without the window.
         Case("d256-full-b4-q4-k28k", 256, 8, 4, 4, 4, 28216, 0, 16),
         # Generic decode shapes, so tuning is not Gemma-only.
@@ -86,7 +91,7 @@ def import_fa4(root: Path):
     return interface._flash_attn_fwd, src
 
 
-def make_inputs(c: Case, seed: int = 0):
+def make_inputs(c: Case, max_seqlen_k: int, seed: int = 0):
     import torch
 
     dev = "cuda"
@@ -98,6 +103,10 @@ def make_inputs(c: Case, seed: int = 0):
     v = torch.randn(nblk, c.page, c.hk, c.d, device=dev, generator=g) * 0.5 + 0.5
     page_table = torch.randperm(nblk, device=dev, generator=g, dtype=torch.int32)
     page_table = page_table.view(c.batch, pages)
+    # vLLM sizes the page table for max_model_len; columns past a request's KV are unused.
+    extra = -(-max_seqlen_k // c.page) - pages
+    if extra > 0:
+        page_table = torch.cat([page_table, page_table.new_zeros(c.batch, extra)], dim=1)
     seqused_k = torch.tensor(
         [max(c.sq, c.sk - 37 * i) for i in range(c.batch)], dtype=torch.int32, device=dev
     )
@@ -145,14 +154,14 @@ def reference(c: Case, inp) -> "torch.Tensor":
     return torch.cat(outs)
 
 
-def make_fn(fwd, c: Case, dtype: str, inp, num_splits: int):
+def make_fn(fwd, c: Case, dtype: str, inp, num_splits: int, max_seqlen_k: int):
     import torch
 
     common = dict(
         cu_seqlens_q=inp["cu_seqlens_q"],
         seqused_k=inp["seqused_k"],
         max_seqlen_q=c.sq,
-        max_seqlen_k=c.sk,
+        max_seqlen_k=max_seqlen_k,
         page_table=inp["page_table"],
         causal=True,
         window_size_left=c.window - 1 if c.window else None,
@@ -258,9 +267,10 @@ def worker(args):
     if args.profile_iters:
         fns = []
         for c in cases:
-            inp = make_inputs(c)
+            max_k = max(c.sk, args.max_seqlen_k)
+            inp = make_inputs(c, max_k)
             for dt in dtypes:
-                fn = make_fn(fwd, c, dt, inp, args.num_splits)
+                fn = make_fn(fwd, c, dt, inp, args.num_splits, max_k)
                 fn()  # JIT compile outside the capture range
                 fns.append((f"{c.name}/{dt}", fn))
         torch.cuda.synchronize()
@@ -279,12 +289,13 @@ def worker(args):
     results = dict(root=str(Path(args.root).resolve()), git=git_rev,
                    gpu=torch.cuda.get_device_name(), runs=[])
     for c in cases:
-        inp = make_inputs(c)
+        max_k = max(c.sk, args.max_seqlen_k)
+        inp = make_inputs(c, max_k)
         ref = reference(c, inp)
         for dt in dtypes:
-            row = dict(case=c.name, dtype=dt, **{"shape": asdict(c)})
+            row = dict(case=c.name, dtype=dt, shape=asdict(c), max_seqlen_k=max_k)
             try:
-                fn = make_fn(fwd, c, dt, inp, args.num_splits)
+                fn = make_fn(fwd, c, dt, inp, args.num_splits, max_k)
                 out = fn()
                 torch.cuda.synchronize()
                 err = out.float() - ref
@@ -328,19 +339,35 @@ def worker(args):
 # ----------------------------------------------------------------------------- compare
 
 
+def parse_trees(specs, default):
+    """--accel / --tuned16 values: PATH or LABEL=PATH."""
+    out = []
+    for i, spec in enumerate(specs):
+        label, _, path = spec.rpartition("=")
+        out.append((label or (default if len(specs) == 1 else f"{default}{i + 1}"), path))
+    return out
+
+
 def compare(args):
     out_dir = Path(args.out_dir)
     baselines = [b for b in args.baselines.split(",") if b]
-    plan = [
-        ("orig", args.orig, baselines + ["fp8"]),
-        ("accel", args.accel, ["fp8"] + (baselines if args.baselines_in_accel else [])),
-    ]
+    accels = parse_trees(args.accel, "accel")
+    tuned = parse_trees(args.tuned16, "tuned16")
+    labels = [l for l, _ in accels + tuned]
+    assert len(set(labels)) == len(labels) and "orig" not in labels, labels
+    plan = (
+        [("orig", args.orig, baselines + ["fp8"])]
+        + [(lbl, root, ["fp8"] + (baselines if args.baselines_in_accel else []))
+           for lbl, root in accels]
+        + [(lbl, root, baselines) for lbl, root in tuned]
+    )
     for label, root, dtypes in plan:
         cmd = [
             sys.executable, __file__, "worker", "--root", root, "--dtypes", ",".join(dtypes),
             "--cases", args.cases, "--out-dir", str(out_dir / label),
             "--iters", str(args.iters), "--prof-iters", str(args.prof_iters),
             "--flush-mb", str(args.flush_mb), "--num-splits", str(args.num_splits),
+            "--max-seqlen-k", str(args.max_seqlen_k),
         ] + (["--verbose"] if args.verbose else [])
         print(f"\n=== {label}: {root}\n$ {' '.join(cmd)}", flush=True)
         subprocess.run(cmd, check=True)
@@ -349,39 +376,58 @@ def compare(args):
     table = {}
     for lbl in res:
         for r in res[lbl]["runs"]:
-            col = r["dtype"] if r["dtype"] != "fp8" else f"fp8-{lbl}"
-            if lbl == "accel" and r["dtype"] != "fp8":
-                col = f"{r['dtype']}-accel"
+            if r["dtype"] == "fp8":
+                col = f"fp8-{lbl}"
+            else:
+                col = r["dtype"] if lbl == "orig" else f"{r['dtype']}-{lbl}"
             table.setdefault(r["case"], {})[col] = r
-    cols = baselines + ["fp8-orig", "fp8-accel"]
+    accel_cols = [f"fp8-{lbl}" for lbl, _ in accels]
+    cols = baselines + ["fp8-orig"] + accel_cols
     if args.baselines_in_accel:
-        cols += [f"{b}-accel" for b in baselines]
+        cols += [f"{b}-{lbl}" for lbl, _ in accels for b in baselines]
+    tuned_cols = [f"{b}-{lbl}" for lbl, _ in tuned for b in baselines]
+    cols += tuned_cols
 
     for lbl in res:
-        print(f"{lbl:6s}: {res[lbl]['git']}  ({res[lbl]['root']})")
+        print(f"{lbl:8s}: {res[lbl]['git']}  ({res[lbl]['root']})")
     print(f"GPU: {res['orig']['gpu']}")
+    if args.max_seqlen_k:
+        print(f"max_seqlen_k passed to the kernels: max(case KV length, {args.max_seqlen_k})")
 
-    def cell(r, key, fmt):
+    def ok(r, key):
+        return r is not None and "error" not in r and r[key] == r[key]
+
+    def cell(r, key):
         if r is None:
             return "-"
-        return "ERR" if "error" in r else format(r[key], fmt)
+        return "ERR" if "error" in r else f"{r[key]:.1f}"
 
+    def speedups(title, pairs, key):
+        """Print ref / new for each (new column, ref column) pair."""
+        names = [f"{n.removeprefix('fp8-')} vs {r.removeprefix('fp8-')}" for n, r in pairs]
+        w = max([16] + [len(n) + 2 for n in names])
+        print(f"\n{title} ({key})")
+        print(f"{'case':22s}" + "".join(f"{n:>{w}s}" for n in names))
+        for case, row in table.items():
+            line = f"{case:22s}"
+            for n, r in pairs:
+                rn, rr = row.get(n), row.get(r)
+                line += (f"{rr[key] / rn[key]:>{w - 1}.2f}x" if ok(rn, key) and ok(rr, key)
+                         else f"{'-':>{w}s}")
+            print(line)
+
+    ratio_cols = [(a, ref) for a in accel_cols for ref in ["fp8-orig"] + baselines + tuned_cols]
+    tuned_ratio_cols = [(f"{b}-{lbl}", b) for lbl, _ in tuned for b in baselines]
     for key, title in (("graph_us", "CUDA-graph latency, us (median, cold L2)"),
                        ("kernel_us", "sum of kernel durations per call, us (cold L2)")):
         print(f"\n{title}")
-        hdr = f"{'case':22s}" + "".join(f"{c:>12s}" for c in cols)
-        hdr += f"{'accel/orig':>12s}" + "".join(f"{'vs ' + b:>10s}" for b in baselines)
-        print(hdr)
+        w = max([12] + [len(c) + 2 for c in cols])
+        print(f"{'case':22s}" + "".join(f"{c:>{w}s}" for c in cols))
         for case, row in table.items():
-            line = f"{case:22s}" + "".join(f"{cell(row.get(c), key, '.1f'):>12s}" for c in cols)
-            a, o = row.get("fp8-accel"), row.get("fp8-orig")
-
-            def ratio(num, width):
-                good = all(r is not None and "error" not in r and r[key] == r[key] for r in (num, a))
-                return f"{num[key] / a[key]:>{width - 1}.2f}x" if good else f"{'-':>{width}s}"
-
-            line += ratio(o, 12) + "".join(ratio(row.get(b), 10) for b in baselines)
-            print(line)
+            print(f"{case:22s}" + "".join(f"{cell(row.get(c), key):>{w}s}" for c in cols))
+        speedups("speedup of each accelerated FP8", ratio_cols, key)
+        if tuned_ratio_cols:
+            speedups("speedup of the decode-tuned 16-bit kernels over stock", tuned_ratio_cols, key)
 
     print("\nCorrectness vs fp32 reference: rel_l1 / rel_bias / PASS|FAIL")
     for case, row in table.items():
@@ -390,23 +436,24 @@ def compare(args):
             if r is None:
                 continue
             if "error" in r:
-                print(f"  {case:22s} {c:12s} ERROR {r['error']}")
+                print(f"  {case:22s} {c:14s} ERROR {r['error']}")
             else:
                 status = "PASS" if r["passed"] else "FAIL"
-                print(f"  {case:22s} {c:12s} {r['rel_l1']:.2e}  {r['rel_bias']:+.1e}  "
+                print(f"  {case:22s} {c:14s} {r['rel_l1']:.2e}  {r['rel_bias']:+.1e}  "
                       f"max_abs {r['max_abs']:.3f}  {status}")
 
     import torch
 
-    print("\nFP8 accel vs FP8 orig output (same inputs):")
-    for case in table:
-        po = out_dir / "orig" / f"{case}__fp8.pt"
-        pa = out_dir / "accel" / f"{case}__fp8.pt"
-        if po.exists() and pa.exists():
-            o, a = torch.load(po).float(), torch.load(pa).float()
-            d = (a - o).abs()
-            print(f"  {case:22s} max |diff| {d.max().item():.3e}  "
-                  f"mean |diff| / mean |orig| {(d.mean() / o.abs().mean()).item():.2e}")
+    for lbl, _ in accels:
+        print(f"\nFP8 {lbl} vs FP8 orig output (same inputs):")
+        for case in table:
+            po = out_dir / "orig" / f"{case}__fp8.pt"
+            pa = out_dir / lbl / f"{case}__fp8.pt"
+            if po.exists() and pa.exists():
+                o, a = torch.load(po).float(), torch.load(pa).float()
+                d = (a - o).abs()
+                print(f"  {case:22s} max |diff| {d.max().item():.3e}  "
+                      f"mean |diff| / mean |orig| {(d.mean() / o.abs().mean()).item():.2e}")
 
 
 def main():
@@ -420,6 +467,9 @@ def main():
         s.add_argument("--flush-mb", type=int, default=128, help="L2 flush size; 0 = warm L2")
         s.add_argument("--num-splits", type=int, default=0, help="0 = split heuristic (vLLM)")
         s.add_argument("--verbose", action="store_true", help="print per-kernel breakdown")
+        s.add_argument("--max-seqlen-k", type=int, default=0,
+                       help="pass max(case KV length, N) as max_seqlen_k, as vLLM's CUDA graphs "
+                       "do with max_model_len (e.g. 32768); 0 = the case's KV length")
     w = sub.choices["worker"]
     w.add_argument("--root", required=True, help="worktree to import flash_attn.cute from")
     w.add_argument("--dtypes", default="fp16,bf16,fp8")
@@ -428,10 +478,14 @@ def main():
                    help="skip checks/timing; run N iters between cudaProfilerStart/Stop")
     c = sub.choices["compare"]
     c.add_argument("--orig", required=True, help="worktree with the original FP8 kernel")
-    c.add_argument("--accel", required=True, help="worktree with the accelerated FP8 kernel")
+    c.add_argument("--accel", required=True, action="append",
+                   help="accelerated FP8 worktree, PATH or LABEL=PATH; repeat to compare several")
     c.add_argument("--baselines", default="fp16,bf16", help="16-bit baselines, run in --orig")
     c.add_argument("--baselines-in-accel", action="store_true",
-                   help="also run the 16-bit baselines in --accel (should match orig)")
+                   help="also run the 16-bit baselines in each --accel tree (should match orig)")
+    c.add_argument("--tuned16", action="append", default=[],
+                   help="worktree with decode tuning for the 16-bit kernels, PATH or LABEL=PATH; "
+                   "runs only the 16-bit baselines; repeatable")
     c.add_argument("--out-dir", default="fp8_results")
     args = p.parse_args()
     worker(args) if args.mode == "worker" else compare(args)

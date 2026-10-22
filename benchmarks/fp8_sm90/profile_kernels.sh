@@ -8,7 +8,9 @@
 #
 # Env knobs: NCU_SET (default full), NCU_COUNT (kernels to capture, default 4),
 #            NCU_CLOCKS (base|none, default base), REPORT_DIR (default ./reports),
-#            NCU_KERNEL (ncu --kernel-name filter; check names in the nsys summary first).
+#            NCU_KERNEL (ncu --kernel-name filter; check names in the nsys summary first),
+#            NCU_EXTRA (extra ncu flags, e.g. "--pm-sampling-interval 1000"),
+#            WORKER_EXTRA (extra fp8_compare.py worker flags, e.g. "--max-seqlen-k 32768").
 set -euo pipefail
 
 ROOT=${1:?worktree}
@@ -21,9 +23,12 @@ NCU_SET=${NCU_SET:-full}
 NCU_COUNT=${NCU_COUNT:-4}
 NCU_CLOCKS=${NCU_CLOCKS:-base}
 NCU_KERNEL=${NCU_KERNEL:-regex:[Ff]lash|cutlass|[Cc]ombine}
+read -r -a NCU_EXTRA_ARGS <<< "${NCU_EXTRA:-}"
+read -r -a WORKER_EXTRA_ARGS <<< "${WORKER_EXTRA:-}"
 mkdir -p "$REPORT_DIR"
 TAG="${LABEL}_${CASE}_${DTYPE}"
-RUN=(python3 "$HERE/fp8_compare.py" worker --root "$ROOT" --cases "$CASE" --dtypes "$DTYPE")
+RUN=(python3 "$HERE/fp8_compare.py" worker --root "$ROOT" --cases "$CASE" --dtypes "$DTYPE"
+     ${WORKER_EXTRA_ARGS[@]+"${WORKER_EXTRA_ARGS[@]}"})
 
 # Timeline: the capture range is the cudaProfilerStart/Stop window around the timed loop,
 # so JIT compilation and warmup are excluded.
@@ -44,6 +49,7 @@ ncu -f -o "$REPORT_DIR/ncu_$TAG" \
     --cache-control all --clock-control "$NCU_CLOCKS" \
     --kernel-name "$NCU_KERNEL" \
     --launch-count "$NCU_COUNT" \
+    ${NCU_EXTRA_ARGS[@]+"${NCU_EXTRA_ARGS[@]}"} \
     "${RUN[@]}" --profile-iters 2
 
 echo "Reports in $REPORT_DIR:"
