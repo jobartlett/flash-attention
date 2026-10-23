@@ -36,7 +36,7 @@ nsys profile -f true -o "$REPORT_DIR/nsys_$TAG" \
     --trace=cuda,nvtx --cuda-graph-trace=node \
     --capture-range=cudaProfilerApi --capture-range-end=stop \
     "${RUN[@]}" --profile-iters 20
-nsys stats --force-overwrite true -f csv -o "$REPORT_DIR/nsys_$TAG" --report cuda_gpu_kern_sum \
+nsys stats --force-export true --force-overwrite true -f csv -o "$REPORT_DIR/nsys_$TAG" --report cuda_gpu_kern_sum \
     "$REPORT_DIR/nsys_$TAG.nsys-rep" >/dev/null
 nsys stats --report cuda_gpu_kern_sum "$REPORT_DIR/nsys_$TAG.nsys-rep"
 
