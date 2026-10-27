@@ -2718,6 +2718,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         num_blocks,
                         kv_producer_state,
                         load_Q_cpasync,
+                        hold_k=pipeline_k if const_expr(self.sol.hold) else None,
                     )
                     self._tr(st.P_ALL_ISSUED, warp_idx_in_wg, 0)
                     q_producer_phase ^= 1
@@ -2852,6 +2853,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         num_blocks: Int32,
         kv_producer_state: pipeline.PipelineState,
         load_Q_cpasync: Optional[Callable] = None,
+        hold_k: Optional[pipeline.PipelineAsync] = None,
     ):
         """Producer loop with a dedicated TMA warp: warp 0 issues Q/K/V loads as far ahead as
         the stages allow, warps 1-3 transpose each block's V in order."""
@@ -2877,7 +2879,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     pipeline_q,
                     q_producer_phase,
                     load_Q,
-                    hold_k=pipeline_k if const_expr(self.sol.hold) else None,
+                    hold_k=hold_k,
                 )
                 if const_expr(q_after_k)
                 else None,
