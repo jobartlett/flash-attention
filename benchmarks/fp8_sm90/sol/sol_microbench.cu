@@ -26,6 +26,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #define CK(x)                                                                              \
@@ -221,29 +222,26 @@ static void run_chase() {
       size_t lines = c.region / 128;
       size_t spare = total / 128 - lines;
       size_t base_line = spare ? (g_rng() % spare) & ~size_t(16383) : 0;  // 2 MB aligned
+      // A random cycle through n distinct lines; the chase wraps around it when n < hops.
+      const size_t n = std::min(lines, size_t(c.hops));
       std::vector<size_t> pick;
-      pick.reserve(c.hops + 1);
-      std::vector<char> used;
-      if (lines <= (size_t(1) << 24)) used.assign(lines, 0);
-      while ((int)pick.size() < c.hops + 1) {
+      pick.reserve(n);
+      std::unordered_set<size_t> used;
+      while (pick.size() < n) {
         size_t l = g_rng() % lines;
-        if (!used.empty()) {
-          if (used[l]) continue;
-          used[l] = 1;
-        }
-        pick.push_back(base_line + l);
+        if (used.insert(l).second) pick.push_back(base_line + l);
       }
-      std::vector<unsigned long long> pos(c.hops), val(c.hops);
-      for (int i = 0; i < c.hops; ++i) {
+      std::vector<unsigned long long> pos(n), val(n);
+      for (size_t i = 0; i < n; ++i) {
         pos[i] = pick[i] * 16;
-        val[i] = pick[i + 1] * 16;
+        val[i] = pick[(i + 1) % n] * 16;
       }
       unsigned long long *dpos, *dval;
-      CK(cudaMalloc(&dpos, c.hops * 8));
-      CK(cudaMalloc(&dval, c.hops * 8));
-      CK(cudaMemcpy(dpos, pos.data(), c.hops * 8, cudaMemcpyHostToDevice));
-      CK(cudaMemcpy(dval, val.data(), c.hops * 8, cudaMemcpyHostToDevice));
-      scatter_u64<<<(c.hops + 255) / 256, 256>>>(buf, dpos, dval, c.hops);
+      CK(cudaMalloc(&dpos, n * 8));
+      CK(cudaMalloc(&dval, n * 8));
+      CK(cudaMemcpy(dpos, pos.data(), n * 8, cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(dval, val.data(), n * 8, cudaMemcpyHostToDevice));
+      scatter_u64<<<int((n + 255) / 256), 256>>>(buf, dpos, dval, int(n));
       CK(cudaDeviceSynchronize());
       l2_flush();
       CK(cudaDeviceSynchronize());

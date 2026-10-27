@@ -14,6 +14,7 @@
 #   variants  each variant untraced and traced (p16)
 #   parse     trace_parse.py OUT_DIR -> OUT_DIR/report/
 # ONLY="hold stream" restricts the variants step to those labels. Logs go to OUT_DIR/logs/.
+# RUN_TIMEOUT / MICRO_TIMEOUT (seconds) kill a hung run or microbenchmark section.
 set -uo pipefail
 
 TREE=${1:?usage: run_sol.sh TRACE_TREE OUT_DIR}
@@ -25,6 +26,8 @@ TREE=$(cd "$TREE" && pwd)
 mkdir -p "$OUT/runs" "$OUT/logs"
 OUT=$(cd "$OUT" && pwd)
 PY=${PY:-python3}
+RUN_TIMEOUT=${RUN_TIMEOUT:-1200}    # seconds per trace_run.py process
+MICRO_TIMEOUT=${MICRO_TIMEOUT:-300} # seconds per microbenchmark section
 export FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=0
 export PYTHONUNBUFFERED=1
 
@@ -49,8 +52,8 @@ run() {
   local label=$1
   shift
   echo "=== $label: $*"
-  if $PY "$HERE/trace_run.py" --root "$TREE" --label "$label" --out-dir "$OUT/runs" "$@" \
-      > "$OUT/logs/$label.log" 2>&1; then
+  if timeout "$RUN_TIMEOUT" $PY "$HERE/trace_run.py" --root "$TREE" --label "$label" \
+      --out-dir "$OUT/runs" "$@" > "$OUT/logs/$label.log" 2>&1; then
     grep -E "PASS|FAIL|graph|traced CTAs" "$OUT/logs/$label.log" | sed 's/^/    /'
   else
     echo "    ERROR (see logs/$label.log):"
@@ -85,10 +88,12 @@ if has_step micro; then
       "$HERE/sol_microbench.cu" -L"${CUDA_HOME:-/usr/local/cuda}/lib64/stubs" -lcuda \
       > logs/microbench_build.log 2>&1 ) || { echo "microbench build failed"; tail -n 30 "$OUT/logs/microbench_build.log"; FAILED+=(micro-build); }
   if [[ -x "$OUT/sol_microbench" ]]; then
+    : > "$OUT/microbench.jsonl"
     for sec in chase bulk burst const dsmem launch; do
       echo "=== microbench $sec"
-      "$OUT/sol_microbench" "$sec" >> "$OUT/microbench.jsonl" 2>> "$OUT/logs/microbench.log" \
-        || { echo "    ERROR (see logs/microbench.log)"; FAILED+=("micro-$sec"); }
+      timeout "$MICRO_TIMEOUT" "$OUT/sol_microbench" "$sec" >> "$OUT/microbench.jsonl" \
+        2>> "$OUT/logs/microbench.log" \
+        || { echo "    ERROR or timeout (see logs/microbench.log)"; FAILED+=("micro-$sec"); }
     done
     if command -v nsys > /dev/null; then
       nsys profile -o "$OUT/microbench_launch" --force-overwrite true -t cuda \
