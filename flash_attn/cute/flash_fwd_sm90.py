@@ -51,6 +51,8 @@ from cutlass.cute import FastDivmodDivisor
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardBase
 from flash_attn.cute.utils import AuxData
+from flash_attn.cute import sol_trace as st
+from flash_attn.cute.sol_trace import SolConfig, sol_config_from_env
 
 
 def _use_intra_wg_overlap_sm90(intra_wg_overlap, native_fp8, head_dim=None, head_dim_v=None):
@@ -733,6 +735,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.pt_stage_bytes = (
             native_fp8_pt_stage_bytes if self.swap_ab or self.direct_m_blocks else 0
         )
+        # Speed-of-light tracing and experimental variants (sol_trace.py); off by default.
+        self.sol = sol_config_from_env() if self.swap_ab and self.cluster_combine else SolConfig()
+        self.trace = self.sol.trace
         assert (native_fp8_o_dtype is not None) == self.native_fp8, (
             "native_fp8_o_dtype must be supplied exactly when native_fp8 is enabled"
         )
@@ -1609,6 +1614,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         descale_tensors=None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        if const_expr(self.trace):
+            bx, by, bz = cute.arch.block_idx()
+            gx, gy, _ = cute.arch.grid_dim()
+            self._tb = cutlass.Int64(self.sol.trace_addr) + cutlass.Int64(
+                (bz * gy + by) * gx + bx
+            ) * cutlass.Int64(st.TRACE_CTA_BYTES)
+        self._tr(st.W0_ENTRY, warp_idx, 0)
+        self._tr(st.W4_ENTRY, warp_idx, 4)
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
             seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
@@ -1634,6 +1647,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             for tma_atom in (tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_O):
                 if const_expr(tma_atom is not None):
                     cpasync.prefetch_descriptor(tma_atom)
+        self._tr(st.W0_PREFETCH, warp_idx, 0)
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
@@ -1673,6 +1687,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         pt_bytes,
                         self._pt_mbar,
                     )
+            self._tr(st.W0_PT_ISSUED, warp_idx, 0)
         elif const_expr(
             self.native_fp8
             and self.one_wave
@@ -1707,14 +1722,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     if const_expr(not self.pack_gqa)
                     else first_head,
                 )
+        self._tr(st.W0_SEQ_ISSUED, warp_idx, 0)
         if const_expr(self.cluster_combine):
             # Every CTA initializes its combine mbarrier before the cluster's first barrier.arrive;
             # the matching barrier.cluster.wait sits right before the first remote store.
+            if const_expr(self.trace):
+                self._cmb_mbar = Int32(storage.mbar_ptr_Cmb.data_ptr().toint())
             if warp_idx == 0:
                 if cute.arch.lane_idx() == 0:
                     _mbarrier_init_shared(Int32(storage.mbar_ptr_Cmb.data_ptr().toint()), Int32(1))
                     _fence_mbarrier_init_cluster()
             cute.arch.cluster_arrive_relaxed()
+            self._tr(st.W0_CMB_INIT, warp_idx, 0)
 
         # Mbarrier / pipeline init
         mbar_ptr_Q = storage.mbar_ptr_Q.data_ptr()
@@ -1829,6 +1848,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
+        self._tr(st.W0_PIPE_INIT, warp_idx, 0)
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
@@ -1901,6 +1921,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         # Cluster wait before starting
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+        self._tr(st.W0_BAR_DONE, warp_idx, 0)
+        self._tr(st.W4_BAR_DONE, warp_idx, 4)
 
         if warp_idx < 4:  # Producer
             cute.arch.setmaxregister_decrease(self.num_producer_regs)
@@ -2494,6 +2516,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         Swap-AB decode skips the transpose: its MMA warpgroup consumes sVLoad directly.
         """
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+        self._tr(st.P_START, warp_idx_in_wg, 0)
         tidx, _, _ = cute.arch.thread_idx()
         is_kv_load_warp = warp_idx_in_wg == 0 or const_expr(not self.use_tma_KV)
         q_producer_phase = Int32(1)
@@ -2636,6 +2659,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 n_block_max - 1 if const_expr(self.use_tma_KV) else cutlass.max(n_block_max - 1, 0)
             )
             num_blocks = cutlass.max(n_block_max - n_block_min, 1)
+            self._tr(st.P_RANGE, warp_idx_in_wg, 0)
+            if const_expr(self.trace):
+                if warp_idx_in_wg == 0:
+                    self._trace_header(
+                        head_idx, batch_idx, split_idx, num_splits, n_block_min, n_block_max
+                    )
+                obs_blocks = Int32(0)
+                if split_active:
+                    obs_blocks = num_blocks
+                if const_expr(self.sol.observer):
+                    if warp_idx_in_wg == 1:
+                        self._trace_observe(pipeline_q, pipeline_k, pipeline_vt, obs_blocks)
+                if const_expr(self.sol.calibrate):
+                    if warp_idx_in_wg == 2:
+                        self._trace_calibrate()
             issue_kv = partial(
                 self._issue_kv_block_native_fp8,
                 load_K,
@@ -2651,6 +2689,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             if const_expr(self._pt_stage):
                 if warp_idx_in_wg == 0:
                     _mbarrier_wait_parity_shared(self._pt_mbar, Int32(0))
+            self._tr(st.P_PT_READY, warp_idx_in_wg, 0)
             if split_active:
                 if const_expr(self.dedicated_kv_load_warp):
                     load_Q_cpasync = None
@@ -2680,6 +2719,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         kv_producer_state,
                         load_Q_cpasync,
                     )
+                    self._tr(st.P_ALL_ISSUED, warp_idx_in_wg, 0)
                     q_producer_phase ^= 1
                 else:
                     kv_producer_state = self._load_kv_transpose_native_fp8(
@@ -2713,6 +2753,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self._pt_stage and self.direct_m_blocks):
             if warp_idx_in_wg == 0:
                 _mbarrier_wait_parity_shared(self._pt_mbar, Int32(0))
+        self._tr(st.P_EXIT, warp_idx_in_wg, 0)
 
     @cute.jit
     def _load_kv_transpose_native_fp8(
@@ -2831,16 +2872,23 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 n_block,
                 kv_producer_state,
                 page_idx,
-                after_k=partial(self._issue_q_tma_native_fp8, pipeline_q, q_producer_phase, load_Q)
+                after_k=partial(
+                    self._issue_q_tma_native_fp8,
+                    pipeline_q,
+                    q_producer_phase,
+                    load_Q,
+                    hold_k=pipeline_k if const_expr(self.sol.hold) else None,
+                )
                 if const_expr(q_after_k)
                 else None,
+                trace_t=Int32(0),
             )
             if const_expr(lookup):
                 page_idx = self._page_lookup(mPageTable, batch_idx, cutlass.max(n_block - 1, 0))
             for i in cutlass.range(num_blocks - 1, unroll=1):
                 kv_producer_state.advance()
                 n_block -= 1
-                issue_kv(n_block, kv_producer_state, page_idx)
+                issue_kv(n_block, kv_producer_state, page_idx, trace_t=i + 1)
                 if const_expr(lookup):
                     page_idx = self._page_lookup(mPageTable, batch_idx, cutlass.max(n_block - 1, 0))
             kv_producer_state.advance()
@@ -2873,11 +2921,26 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
     @cute.jit
     def _issue_q_tma_native_fp8(
-        self, pipeline_q: pipeline.PipelineAsync, q_producer_phase: Int32, load_Q: Callable
+        self,
+        pipeline_q: pipeline.PipelineAsync,
+        q_producer_phase: Int32,
+        load_Q: Callable,
+        hold_k: Optional[pipeline.PipelineAsync] = None,
     ):
-        """Acquire the Q stage and issue the Q tile's TMA load."""
+        """Acquire the Q stage and issue the Q tile's TMA load. With hold_k (variant hold),
+        then wait until Q and the first K tile have landed."""
         pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+        self._tr(st.P_Q_ACQ, Int32(0), 0)
         load_Q(tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(0))
+        self._tr(st.P_Q_ISSUED, Int32(0), 0)
+        if const_expr(hold_k is not None):
+            _mbarrier_wait_parity_shared(
+                Int32(pipeline_q.sync_object_full.get_barrier(0).toint()), Int32(0)
+            )
+            _mbarrier_wait_parity_shared(
+                Int32(hold_k.sync_object_full.get_barrier(0).toint()), Int32(0)
+            )
+            self._tr(st.P_HOLD_DONE, Int32(0), 0)
 
     @cute.jit
     def _issue_kv_block_native_fp8(
@@ -2894,6 +2957,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         seqlen_k: Int32 = Int32(0),
         page_size: Optional[Int32] = None,
         after_k: Optional[Callable] = None,
+        trace_t: Optional[Int32] = None,
     ):
         """Issue one K/V block. With tma_box_n, the tile is split into page-aligned TMA boxes;
         lane b looks up the page of box b and the boxes are issued from lane-shuffled indices
@@ -2921,22 +2985,28 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 else cute.arch.shuffle_sync(my_row_box, box)
                 for box in range(nbox)
             ]
+            w0 = Int32(0)
+            self._tr(st.P_TILE + st.PT_K_ACQ_START, w0, 0, trace_t)
             pipeline_k.producer_acquire(producer_state)
+            self._tr(st.P_TILE + st.PT_K_ACQ, w0, 0, trace_t)
             for box in cutlass.range_constexpr(nbox):
                 load_K(
                     src_idx=(box_rows[box], 0, box_pages[box]),
                     dst_idx=box + nbox * producer_state.index,
                     tma_bar_ptr=pipeline_k.producer_get_barrier(producer_state),
                 )
+            self._tr(st.P_TILE + st.PT_K_ISSUED, w0, 0, trace_t)
             if const_expr(after_k is not None):
                 after_k()
             pipeline_vt.producer_acquire(producer_state)
+            self._tr(st.P_TILE + st.PT_V_ACQ, w0, 0, trace_t)
             for box in cutlass.range_constexpr(nbox):
                 load_V(
                     src_idx=(box_rows[box], 0, box_pages[box]),
                     dst_idx=box + nbox * producer_state.index,
                     tma_bar_ptr=pipeline_vt.producer_get_barrier(producer_state),
                 )
+            self._tr(st.P_TILE + st.PT_V_ISSUED, w0, 0, trace_t)
         else:
             pipeline_k.producer_acquire(producer_state)
             load_K(block=n_block, producer_state=producer_state, page_idx=page_idx)
@@ -3622,6 +3692,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         num_dt = const_expr((self.tile_hdimv + 63) // 64)
         hdimv_mma = const_expr(64 * num_dt)
         warp = cute.arch.make_warp_uniform(tidx // cute.arch.WARP_SIZE)
+        self._tr(st.C_START, warp, 0)
         lane = cute.arch.lane_idx()
         lane_g = lane // 4
         lane_c = lane % 4
@@ -3732,14 +3803,47 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 row_max.fill(-Float32.inf)
                 row_sum.fill(0.0)
                 acc_O.fill(0.0)
+                self._tr(st.C_SETUP, warp, 0)
                 pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
-                if const_expr(self.sab_n <= _SAB_PIPELINE_MAX_ROWS):
+                self._tr(st.C_Q, warp, 0)
+                if const_expr(self.sol.prewait):
+                    for s in cutlass.range_constexpr(self.num_stages):
+                        if s < num_blocks:
+                            _mbarrier_wait_parity_shared(
+                                Int32(pipeline_k.sync_object_full.get_barrier(s).toint()), Int32(0)
+                            )
+                            _mbarrier_wait_parity_shared(
+                                Int32(pipeline_vt.sync_object_full.get_barrier(s).toint()),
+                                Int32(0),
+                            )
+                    self._tr(st.C_PREWAIT, warp, 0)
+                if const_expr(self.sol.stream):
+                    # Variant stream: only wait for and release each K/V tile.
+                    for i in cutlass.range(num_blocks, unroll=1):
+                        pipeline_k.consumer_wait(
+                            kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state)
+                        )
+                        self._tr(st.C_TILE + st.CT_K, warp, 0, i)
+                        pipeline_k.consumer_release(kv_consumer_state)
+                        pipeline_vt.consumer_wait(
+                            kv_consumer_state, pipeline_vt.consumer_try_wait(kv_consumer_state)
+                        )
+                        self._tr(st.C_TILE + st.CT_V, warp, 0, i)
+                        pipeline_vt.consumer_release(kv_consumer_state)
+                        kv_consumer_state.advance()
+                    row_scale.fill(0.0)
+                    acc_O_tile.fill(0.0)
+                    last_scale = cute.make_rmem_tensor_like(row_scale, Float32)
+                    last_scale.store(row_scale.load())
+                elif const_expr(self.sab_n <= _SAB_PIPELINE_MAX_ROWS):
                     # Software-pipelined: iteration i issues QK(i) and PV(i - 1) back to back,
                     # loads V^T(i) into tOrVt_next while they run, folds O_tile(i - 1) with the
                     # row scale P(i - 1) was computed with (prev_scale), then computes P(i).
                     pipeline_k.consumer_wait(
                         kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state)
                     )
+                    t0 = Int32(0)
+                    self._tr(st.C_TILE + st.CT_K, warp, 0, t0)
                     acc_S = sm90_utils.gemm_zero_init(
                         tiled_mma_qk,
                         (self.tile_n, n_rows),
@@ -3748,6 +3852,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         A_idx=kv_consumer_state.index,
                         wg_wait=-1,
                     )
+                    self._tr(st.C_TILE + st.CT_MMA_ISSUED, warp, 0, t0)
                     self._sab_load_vt_native_fp8(
                         pipeline_vt,
                         kv_consumer_state,
@@ -3757,8 +3862,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         vload_swizzle,
                         lane,
                         warp,
+                        trace_t=t0,
                     )
+                    self._tr(st.C_TILE + st.CT_VT, warp, 0, t0)
                     warpgroup.wait_group(0)
+                    self._tr(st.C_TILE + st.CT_MMA_DONE, warp, 0, t0)
                     pipeline_k.consumer_release(kv_consumer_state)
                     red_parity = self._sab_softmax_p_native_fp8(
                         acc_S,
@@ -3780,14 +3888,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         lane_g,
                         lane_c,
                     )
+                    self._tr(st.C_TILE + st.CT_P, warp, 0, t0)
                     kv_consumer_state.advance()
                     for i in cutlass.range(num_blocks - 1, unroll=1):
+                        t = i + 1
                         n_block = n_block_max - 2 - i
                         prev_scale = cute.make_rmem_tensor_like(row_scale, Float32)
                         prev_scale.store(row_scale.load())
                         pipeline_k.consumer_wait(
                             kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state)
                         )
+                        self._tr(st.C_TILE + st.CT_K, warp, 0, t)
                         acc_S = sm90_utils.gemm_zero_init(
                             tiled_mma_qk,
                             (self.tile_n, n_rows),
@@ -3799,6 +3910,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         sm90_utils.gemm(
                             tiled_mma_pv, acc_O_tile, tOrVt, tOrPt, zero_init=True, wg_wait=-1
                         )
+                        self._tr(st.C_TILE + st.CT_MMA_ISSUED, warp, 0, t)
                         self._sab_load_vt_native_fp8(
                             pipeline_vt,
                             kv_consumer_state,
@@ -3808,14 +3920,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             vload_swizzle,
                             lane,
                             warp,
+                            trace_t=t,
                         )
+                        self._tr(st.C_TILE + st.CT_VT, warp, 0, t)
                         warpgroup.wait_group(0)
+                        self._tr(st.C_TILE + st.CT_MMA_DONE, warp, 0, t)
                         pipeline_k.consumer_release(kv_consumer_state)
                         self._fold_o_tile_native_fp8(acc_O, acc_O_tile, prev_scale)
                         # An opaque copy: if the compiler merged the two fragments, the next
                         # tile's V^T loads would overwrite registers an in-flight WGMMA reads.
                         for e in cutlass.range_constexpr(cute.size(tOrVt_i32)):
                             tOrVt_i32[e] = _mov_b32(tOrVt_next_i32[e])
+                        self._tr(st.C_TILE + st.CT_FOLD, warp, 0, t)
                         need_mask = n_block >= n_block_mask_right or n_block < n_block_mask_left
                         red_parity = self._sab_softmax_p_native_fp8(
                             acc_S,
@@ -3837,10 +3953,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             lane_g,
                             lane_c,
                         )
+                        self._tr(st.C_TILE + st.CT_P, warp, 0, t)
                         kv_consumer_state.advance()
                     sm90_utils.gemm(
                         tiled_mma_pv, acc_O_tile, tOrVt, tOrPt, zero_init=True, wg_wait=-1
                     )
+                    self._tr(st.C_LOOP_DONE, warp, 0)
                     last_scale = cute.make_rmem_tensor_like(row_scale, Float32)
                     last_scale.store(row_scale.load())
                 else:
@@ -3913,6 +4031,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 cute.arch.barrier(
                     barrier_id=self._sab_barrier_id, number_of_threads=self.num_mma_threads
                 )
+                self._tr(st.C_ROWSUM, warp, 0)
                 # The cluster combine normalizes after merging the splits (it needs the raw row
                 # max and sum); otherwise compute 1 / sum (with the V descale) and the LSE here.
                 if const_expr(self.cluster_combine):
@@ -3953,6 +4072,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(self.sab_n <= _SAB_PIPELINE_MAX_ROWS):
                     warpgroup.wait_group(0)
                     self._fold_o_tile_native_fp8(acc_O, acc_O_tile, last_scale)
+                self._tr(st.C_FOLD, warp, 0)
                 # A split with no KV block in range contributes O = 0 with LSE = -inf.
                 if const_expr(self.is_split_kv):
                     if n_block_min >= n_block_max:
@@ -4051,6 +4171,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 )
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+        self._tr(st.C_EXIT, warp, 0)
 
     @cute.jit
     def _sab_load_vt_native_fp8(
@@ -4063,10 +4184,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         vload_swizzle,
         lane: Int32,
         warp: Int32,
+        trace_t: Optional[Int32] = None,
     ):
         """Wait for a V tile in sVLoad, load it as the V^T register operand and release it."""
         num_dt = const_expr((self.tile_hdimv + 63) // 64)
         pipeline_vt.consumer_wait(state, pipeline_vt.consumer_try_wait(state))
+        if const_expr(trace_t is not None):
+            self._tr(st.C_TILE + st.CT_V, warp, 0, trace_t)
         for kb in cutlass.range_constexpr(self.tile_n // 32):
             for dt in cutlass.range_constexpr(num_dt):
                 if const_expr(64 * (dt + 1) <= self.tile_hdimv):
@@ -4339,6 +4463,53 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tidx: Int32,
         cmb_bases,
     ):
+        self._tr(st.CMB_START, warp, 0)
+        if const_expr(self.sol.nomerge):
+            # Variant nomerge: no exchange; still pair the prologue's cluster arrive.
+            cute.arch.cluster_wait()
+        else:
+            self._cluster_combine_body_native_fp8(
+                acc_O,
+                row_max,
+                row_sum,
+                v_descale,
+                scale_log2,
+                mO,
+                mLSE,
+                seqlen,
+                m_block,
+                head_idx,
+                batch_idx,
+                split_idx,
+                warp,
+                lane_g,
+                lane_c,
+                tidx,
+                cmb_bases,
+            )
+        self._tr(st.CMB_DONE, warp, 0)
+
+    @cute.jit
+    def _cluster_combine_body_native_fp8(
+        self,
+        acc_O: cute.Tensor,
+        row_max: cute.Tensor,
+        row_sum: cute.Tensor,
+        v_descale: Float32,
+        scale_log2: Float32,
+        mO: cute.Tensor,
+        mLSE: Optional[cute.Tensor],
+        seqlen: SeqlenInfoQK,
+        m_block: Int32,
+        head_idx: Int32,
+        batch_idx: Int32,
+        split_idx: Int32,
+        warp: Int32,
+        lane_g: Int32,
+        lane_c: Int32,
+        tidx: Int32,
+        cmb_bases,
+    ):
         """Split-KV combine inside the cluster of a (head, batch)'s splits, through DSMEM.
 
         The rows x hdim_v outputs are divided into 16-byte groups (4 channels of one row), each
@@ -4392,7 +4563,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     * 16
                 )
             _mbarrier_arrive_expect_tx_shared(mbar_base, num_cta * (owned_bytes + num_q_rows * 8))
+        self._tr(st.CMB_ARMED, warp, 0)
         cute.arch.cluster_wait()
+        self._tr(st.CMB_CLUSTER, warp, 0)
         # Push the partial O of every live (row, group) to the CTA that owns it.
         for j in cutlass.range_constexpr(num_n8):
             if const_expr(self.cmb_v4):
@@ -4458,7 +4631,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         row_sum[0, j],
                         _mapa_shared_cluster(mbar_base, owner),
                     )
+        self._tr(st.CMB_PUSHED, warp, 0)
         _mbarrier_wait_parity_shared(mbar_base, Int32(0))
+        self._tr(st.CMB_LANDED, warp, 0)
         # Merge the splits of each owned group and write the final O (and LSE once per row).
         mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
         mLSE_cur = None
@@ -4546,6 +4721,166 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     def _cmb_groups_per_cta(self) -> int:
         """16-byte O groups each CTA of the cluster combine owns (_cluster_groups_per_cta_sm90)."""
         return _cluster_groups_per_cta_sm90(self.cluster_splits, self.sab_n, self.tile_hdimv)
+
+    def _tr(self, slot: int, who, want: int, t=None):
+        """Trace event (sol_trace.py): lane 0 of the warp with who == want records its time at
+        slot, or at slot + TRACE_TILE_STRIDE * t for a per-tile event. No-op without tracing."""
+        if not self.trace:
+            return
+        addr = self._tb + cutlass.Int64(slot * 8)
+        if t is not None:
+            t_c = cutlass.min(Int32(t), Int32(st.TRACE_MAX_TILES - 1))
+            addr = addr + cutlass.Int64(t_c) * cutlass.Int64(st.TRACE_TILE_STRIDE * 8)
+        st.trace_ev(addr, Int32(who), Int32(want))
+
+    @cute.jit
+    def _trace_header(
+        self,
+        head_idx: Int32,
+        batch_idx: Int32,
+        split_idx: Int32,
+        num_splits: Int32,
+        n_block_min: Int32,
+        n_block_max: Int32,
+    ):
+        """Per-CTA header (values, not times); every lane of the warp stores the same words."""
+        bx, by, bz = cute.arch.block_idx()
+        tb = self._tb
+        _st_global_v2_b32(
+            tb + cutlass.Int64(st.HDR_MAGIC * 8), Int32(st.TRACE_MAGIC), Int32(st.TRACE_VERSION)
+        )
+        _st_global_v2_b32(
+            tb + cutlass.Int64(st.HDR_SM * 8), st.read_smid(), st.read_cluster_ctarank()
+        )
+        _st_global_v2_b32(tb + cutlass.Int64(st.HDR_CTA_XY * 8), Int32(bx), Int32(by))
+        _st_global_v2_b32(
+            tb + cutlass.Int64(st.HDR_CTA_Z * 8), Int32(bz), n_block_max - n_block_min
+        )
+        _st_global_v2_b32(tb + cutlass.Int64(st.HDR_RANGE * 8), n_block_min, n_block_max)
+        _st_global_v2_b32(
+            tb + cutlass.Int64(st.HDR_ACTIVE * 8), Int32(split_idx), Int32(num_splits)
+        )
+        _st_global_v2_b32(
+            tb + cutlass.Int64(st.HDR_TILE * 8), Int32(head_idx), Int32(batch_idx)
+        )
+
+    @cute.jit
+    def _trace_poll_tile(
+        self,
+        bar: Int32,
+        t: cutlass.Constexpr[int],
+        num_blocks: Int32,
+        mask: Int32,
+        slot: cutlass.Constexpr[int],
+    ) -> Int32:
+        """Observer: if tile t has landed on its stage's full barrier, record it and set bit t.
+        A stage's tiles land in order, so tile t is only tested once tile t - stages landed
+        (testing its parity earlier would see the previous phase)."""
+        S = const_expr(self.num_stages)
+        res = mask
+        prev_done = Int32(1)
+        if const_expr(t >= S):
+            prev_done = (mask >> (t - S)) & 1
+        if t < num_blocks:
+            if (mask >> t) & 1 == 0:
+                if prev_done != 0:
+                    if st.mbar_test_wait(bar, Int32((t // S) % 2)) != 0:
+                        self._tr(slot + t, Int32(1), 1)
+                        res = mask | (1 << t)
+        return res
+
+    @cute.jit
+    def _trace_observe(
+        self,
+        pipeline_q: pipeline.PipelineAsync,
+        pipeline_k: pipeline.PipelineAsync,
+        pipeline_vt: pipeline.PipelineAsync,
+        num_blocks: Int32,
+    ):
+        """Observer warp (idle producer warp 1): poll the full barriers of the page-table row,
+        Q and the first OBS_TILES K and V tiles, recording when each lands; then the cluster
+        combine's mbarrier (every split's partial in this CTA)."""
+        S = const_expr(self.num_stages)
+        obs_tiles = const_expr(min(st.TRACE_MAX_TILES, 4))
+        w = Int32(1)
+        self._tr(st.O_START, w, 1)
+        q_bar = Int32(pipeline_q.sync_object_full.get_barrier(0).toint())
+        k_bars = [Int32(pipeline_k.sync_object_full.get_barrier(s).toint()) for s in range(S)]
+        v_bars = [Int32(pipeline_vt.sync_object_full.get_barrier(s).toint()) for s in range(S)]
+        all_mask = (Int32(1) << cutlass.min(num_blocks, Int32(obs_tiles))) - 1
+        pt_pend = Int32(1) if const_expr(self._pt_stage) else Int32(0)
+        # An inactive split (num_blocks == 0) never loads Q.
+        q_pend = Int32(0)
+        if num_blocks > 0:
+            q_pend = Int32(1)
+        kmask = Int32(0)
+        vmask = Int32(0)
+        it = Int32(0)
+        busy = Int32(1)
+        while busy != 0:
+            if const_expr(self._pt_stage):
+                if pt_pend != 0:
+                    if st.mbar_test_wait(self._pt_mbar, Int32(0)) != 0:
+                        self._tr(st.O_PT, w, 1)
+                        pt_pend = Int32(0)
+            if q_pend != 0:
+                if st.mbar_test_wait(q_bar, Int32(0)) != 0:
+                    self._tr(st.O_Q, w, 1)
+                    q_pend = Int32(0)
+            for t in cutlass.range_constexpr(obs_tiles):
+                kmask = self._trace_poll_tile(k_bars[t % S], t, num_blocks, kmask, st.O_K)
+                vmask = self._trace_poll_tile(v_bars[t % S], t, num_blocks, vmask, st.O_V)
+            it += 1
+            busy = pt_pend + q_pend
+            if kmask != all_mask:
+                busy += 1
+            if vmask != all_mask:
+                busy += 1
+            if it >= (1 << 18):
+                busy = Int32(0)
+        if const_expr(self.cluster_combine and not self.sol.nomerge):
+            pend = Int32(1)
+            while pend != 0:
+                if st.mbar_test_wait(self._cmb_mbar, Int32(0)) != 0:
+                    self._tr(st.O_CMB, w, 1)
+                    pend = Int32(0)
+                it += 1
+                if it >= (1 << 19):
+                    pend = Int32(0)
+        self._tr(st.O_END, w, 1)
+        _st_global_v2_b32(
+            self._tb + cutlass.Int64(st.HDR_OBS * 8), it, kmask | (vmask << 16)
+        )
+
+    @cute.jit
+    def _trace_calibrate(self):
+        """Calibration warp (idle producer warp 2): once the CTA's work is done (combine
+        partials landed), record (globaltimer, clock) right after three globaltimer edges, which
+        gives the timer resolution and an exact clock anchor for this SM."""
+        w = Int32(2)
+        self._tr(st.W2_CAL_START, w, 2)
+        if const_expr(self.cluster_combine and not self.sol.nomerge):
+            _mbarrier_wait_parity_shared(self._cmb_mbar, Int32(0))
+        g_prev = st.read_globaltimer_lo()
+        n_first = Int32(0)
+        n_total = Int32(0)
+        for e in cutlass.range_constexpr(3):
+            spin = Int32(1)
+            g = g_prev
+            c = Int32(0)
+            while spin != 0:
+                g, c = st.read_timer_pair()
+                n_total += 1
+                if g != g_prev:
+                    spin = Int32(0)
+                if n_total >= (1 << 16):
+                    spin = Int32(0)
+            if const_expr(e == 0):
+                n_first = n_total
+            _st_global_v2_b32(self._tb + cutlass.Int64((st.HDR_CAL + e) * 8), g, c)
+            g_prev = g
+        _st_global_v2_b32(self._tb + cutlass.Int64(st.HDR_CAL_ITERS * 8), n_first, n_total)
+        self._tr(st.W2_CAL_END, w, 2)
 
     @cute.jit
     def _push_o_pair_native_fp8(

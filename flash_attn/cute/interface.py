@@ -39,6 +39,7 @@ from flash_attn.cute.cute_dsl_utils import (
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90, _cluster_groups_per_cta_sm90
+from flash_attn.cute.sol_trace import sol_env_key
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
@@ -2180,6 +2181,11 @@ def _flash_attn_fwd(
             native_fp8_swap_ab_q_rows,
             cluster=native_fp8_cluster_splits is not None,
         )
+        # Speed-of-light experiments (sol_trace.py): FA4_SOL_STAGES overrides the K/V stages of
+        # a swap-AB launch; the page-table staging then budgets for one CTA per SM.
+        sol_stages = int(os.environ.get("FA4_SOL_STAGES", "0") or "0")
+        if sol_stages and native_fp8_swap_ab_rows is not None:
+            native_fp8_num_stages = sol_stages
         native_fp8_one_wave = num_ctas <= native_fp8_ctas_per_sm * get_num_sms_for_selection(
             device.index, arch
         )
@@ -2192,7 +2198,7 @@ def _flash_attn_fwd(
             tile_n,
             head_dim,
             head_dim_v,
-            native_fp8_ctas_per_sm,
+            1 if sol_stages else native_fp8_ctas_per_sm,
             native_fp8_num_stages,
             native_fp8_swap_ab_q_rows,
             native_fp8_cluster_splits,
@@ -2210,6 +2216,7 @@ def _flash_attn_fwd(
             native_fp8_one_wave,
             native_fp8_pt_stage_bytes,
             native_fp8_tma_box_n is not None and page_size == native_fp8_tma_box_n,
+            sol_env_key(),
         )
     if use_dedicated_hd256_kernel:
         compile_key += (
