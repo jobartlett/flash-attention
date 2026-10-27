@@ -123,6 +123,8 @@ if has_step variants; then
   pair stream-nomerge --variant stream,nomerge
   pair ptid --page-order identity
   pair noflush --flush-mb 0
+  pair rflush --flush-kind read --flush-mb 256
+  pair rflush-stages3 --stages 3 --flush-kind read --flush-mb 256
   pair balanced --window 1149 --aligned-seqlens
   pair 1cluster --batch 1 --hk 1 --hq 2
   pair 4cluster --batch 1 --hk 4 --hq 8

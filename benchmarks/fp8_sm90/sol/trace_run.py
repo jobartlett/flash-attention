@@ -47,6 +47,20 @@ def build_case(args):
     return replace(c, name=f"{c.name}+{args.label}", **over) if over else c
 
 
+class ReadFlush:
+    """Reads a buffer larger than L2, leaving it full of clean lines: the kernel's misses then
+    evict without write-backs (fc.L2Flush's copy leaves every line dirty)."""
+
+    def __init__(self, mb: int):
+        import torch
+
+        self.src = torch.ones(mb * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")
+
+    def __call__(self):
+        if self.src.numel():
+            self.src.amax()
+
+
 def capture_graph(fn):
     import torch
 
@@ -80,6 +94,8 @@ def main():
     p.add_argument("--num-splits", type=int, default=0)
     p.add_argument("--max-seqlen-k", type=int, default=0)
     p.add_argument("--flush-mb", type=int, default=128, help="L2 flush before each call; 0 = warm")
+    p.add_argument("--flush-kind", choices=["copy", "read"], default="copy",
+                   help="copy: D2D memcpy (dirty L2); read: a reduction over the buffer (clean L2)")
     p.add_argument("--iters", type=int, default=200, help="CUDA-graph timing iterations")
     p.add_argument("--prof-iters", type=int, default=50, help="torch-profiler kernel iterations")
     p.add_argument("--trace-iters", type=int, default=40, help="traced replays to keep")
@@ -118,6 +134,7 @@ def main():
     meta = dict(label=args.label, case=args.case, shape=asdict(c), trace=args.trace,
                 variant=args.variant, stages=args.stages, page_order=args.page_order,
                 aligned_seqlens=args.aligned_seqlens, flush_mb=args.flush_mb,
+                flush_kind=args.flush_kind,
                 num_splits=args.num_splits, max_seqlen_k=max_k, root=str(Path(args.root).resolve()),
                 src=str(src), git=git_rev, gpu=torch.cuda.get_device_name(),
                 seqused_k=inp["seqused_k"].tolist(), clocks_start=gpu_clocks())
@@ -135,7 +152,7 @@ def main():
     print(f"[sol] {args.label}: rel_l1 {rel_l1:.2e} bias {bias:+.1e} "
           f"{'PASS' if meta['passed'] else 'FAIL'}", flush=True)
 
-    flush = fc.L2Flush(args.flush_mb)
+    flush = ReadFlush(args.flush_mb) if args.flush_kind == "read" else fc.L2Flush(args.flush_mb)
     meta["graph_us"] = fc.time_graph(fn, flush, args.iters)
     meta["kernel_us"], meta["kernels"] = fc.time_kernels(fn, flush, args.prof_iters)
     print(f"[sol] {args.label}: graph {meta['graph_us']:.2f} us, kernels {meta['kernel_us']:.2f} us",
