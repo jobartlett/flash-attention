@@ -1,7 +1,7 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Parse a speed-of-light results directory (run_sol.sh): traced runs, variants, microbenchmarks.
 
-  python benchmarks/fp8_sm90/sol/trace_parse.py sol-results [--iter median|N]
+  python3 benchmarks/fp8_sm90/sol/trace_parse.py sol-results [--iter median|N]
 
 Writes sol-results/report/:
   summary.md                  variant table, per-phase breakdowns per warp role, load latencies,

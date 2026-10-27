@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Run one configuration of the SM90 FP8 decode kernel for the speed-of-light study.
 
 One process is one kernel build: the trace switch, the variant and the stage override are read
@@ -7,7 +7,7 @@ worktree), so they are set here before the first call. Each run writes, under OU
   meta.json   shape, knobs, correctness, CUDA-graph and kernel timings, GPU info
   trace.npy   uint32 [iters, n_cta, 256 slots, (globaltimer_lo, clock)]  (with --trace)
 
-  python benchmarks/fp8_sm90/sol/trace_run.py --root ../fa4-dtrace --case gemma-swa-p16 \
+  python3 benchmarks/fp8_sm90/sol/trace_run.py --root ../fa4-dtrace --case gemma-swa-p16 \
       --label base-trace --trace --out-dir sol-results/runs
 """
 

@@ -24,7 +24,7 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TREE=$(cd "$TREE" && pwd)
 mkdir -p "$OUT/runs" "$OUT/logs"
 OUT=$(cd "$OUT" && pwd)
-PY=${PY:-python}
+PY=${PY:-python3}
 export FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=0
 export PYTHONUNBUFFERED=1
 
