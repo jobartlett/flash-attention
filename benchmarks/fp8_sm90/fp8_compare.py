@@ -13,9 +13,10 @@ reference therefore scores every variant.
   # full comparison (spawns one worker per tree, prints tables)
   python benchmarks/fp8_sm90/fp8_compare.py compare --orig . --accel ../fa4-accel
 
-  # also time the 16-bit kernels with the same decode tuning (branch fa4-sm90-16bit-decode-opts)
-  python benchmarks/fp8_sm90/fp8_compare.py compare --orig . --accel b=../fa4-accel \
-      --tuned16 b16opt=../fa4-16bit
+  # also time the 16-bit kernels with the same decode tuning (branch fa4-sm90-16bit-decode),
+  # over the vLLM decode shapes of the PR tables
+  python benchmarks/fp8_sm90/fp8_compare.py compare --orig ../fa4-accel --accel b=../fa4-accel \
+      --tuned16 b16=../fa4-16bit --cases pr --max-seqlen-k 32768
 
   # one tree / case / dtype, e.g. under nsys or ncu
   python benchmarks/fp8_sm90/fp8_compare.py worker --root ../fa4-accel \
@@ -43,7 +44,7 @@ class Case:
     hk: int
     batch: int
     sq: int  # query tokens per request
-    sk: int  # max KV length; request i has sk - 37 * i keys
+    sk: int  # max KV length; request i has sk - (37 * i) % (sk // 4) keys
     window: int  # sliding window size in keys; 0 = full causal
     page: int  # KV cache page size
 
@@ -63,8 +64,25 @@ CASES = {
         # Long KV, nonzero-mean V: exposes FP8 PV accumulation bias.
         Case("d128-b1-q1-k128k", 128, 32, 8, 1, 1, 131072, 0, 16),
         Case("d128-prefill-4k", 128, 32, 8, 1, 4096, 4096, 0, 64),
+        # Gemma-4-31B TP4 full-attention layers (d512, one KV head); no native FP8 path.
+        Case("gemma-full-d512-p16", 512, 8, 1, 4, 4, 28216, 0, 16),
+        # vLLM decode shapes of vllm-project/flash-attention#206.
+        Case("llama8b-b1-q1-k4k", 128, 32, 8, 1, 1, 4096, 0, 16),
+        Case("llama8b-b32-q1-k2k", 128, 32, 8, 32, 1, 2048, 0, 16),
+        Case("llama8b-b128-q1-k1k", 128, 32, 8, 128, 1, 1024, 0, 16),
+        Case("llama8b-b16-q1-k16k", 128, 32, 8, 16, 1, 16384, 0, 16),
+        Case("llama8b-b32-q4-k4k", 128, 32, 8, 32, 4, 4096, 0, 16),
+        Case("llama70b-b64-q1-k4k", 128, 16, 2, 64, 1, 4096, 0, 16),
+        Case("llama70b-b8-q1-k32k", 128, 16, 2, 8, 1, 32768, 0, 16),
+        Case("qwen32b-b32-q1-k8k", 128, 32, 4, 32, 1, 8192, 0, 16),
     ]
 }
+# Gemma-4 (sliding window and full attention), Llama-3.1-8B/70B and Qwen3-32B decode.
+PR_CASES = ",".join([
+    "gemma-swa-p16", "gemma-swa-b16-p16", "gemma-full-d512-p16", "llama8b-b1-q1-k4k",
+    "llama8b-b32-q1-k2k", "llama8b-b128-q1-k1k", "llama8b-b16-q1-k16k", "llama8b-b32-q4-k4k",
+    "llama70b-b64-q1-k4k", "llama70b-b8-q1-k32k", "qwen32b-b32-q1-k8k",
+])
 DEFAULT_CASES = ",".join(CASES)
 
 # Pass thresholds on (mean |err| / mean |ref|, |mean err| / |mean ref|).
@@ -108,7 +126,9 @@ def make_inputs(c: Case, max_seqlen_k: int, seed: int = 0):
     if extra > 0:
         page_table = torch.cat([page_table, page_table.new_zeros(c.batch, extra)], dim=1)
     seqused_k = torch.tensor(
-        [max(c.sq, c.sk - 37 * i) for i in range(c.batch)], dtype=torch.int32, device=dev
+        [max(c.sq, c.sk - (37 * i) % max(1, c.sk // 4)) for i in range(c.batch)],
+        dtype=torch.int32,
+        device=dev,
     )
     cu_seqlens_q = torch.arange(
         0, (c.batch + 1) * c.sq, c.sq, dtype=torch.int32, device=dev
@@ -461,7 +481,8 @@ def main():
     sub = p.add_subparsers(dest="mode", required=True)
     for name in ("worker", "compare"):
         s = sub.add_parser(name)
-        s.add_argument("--cases", default=DEFAULT_CASES, help=f"comma list of: {DEFAULT_CASES}")
+        s.add_argument("--cases", default=DEFAULT_CASES,
+                       help=f"comma list of: {DEFAULT_CASES}; or 'pr' for {PR_CASES}")
         s.add_argument("--iters", type=int, default=200, help="CUDA-graph timing iterations")
         s.add_argument("--prof-iters", type=int, default=50, help="profiler timing iterations")
         s.add_argument("--flush-mb", type=int, default=128, help="L2 flush size; 0 = warm L2")
@@ -488,6 +509,8 @@ def main():
                    "runs only the 16-bit baselines; repeatable")
     c.add_argument("--out-dir", default="fp8_results")
     args = p.parse_args()
+    if args.cases == "pr":
+        args.cases = PR_CASES
     worker(args) if args.mode == "worker" else compare(args)
 
 
