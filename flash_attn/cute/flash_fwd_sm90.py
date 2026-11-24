@@ -958,6 +958,23 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                 num_splits=num_splits,
             )
+        # Local kernel with per-sequence causal: a causal sequence keeps the left
+        # window and gets a zero right window, i.e. causal sliding-window attention.
+        # Producer, consumer and mask must all take their block ranges from it.
+        block_info_causal = None
+        if const_expr(mDynamicCausal is not None and self.is_local):
+            assert self.kv_cluster_m == 1, "dynamic_causal local kernels use one CTA per K/V range"
+            block_info_causal = BlockInfo(
+                self.tile_m,
+                self.tile_n,
+                False,
+                True,
+                self.is_split_kv,
+                window_size_left,
+                Int32(0),
+                qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                num_splits=num_splits,
+            )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
             seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
@@ -987,6 +1004,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         self._mDynamicCausal = mDynamicCausal
+        self._block_info_causal = block_info_causal
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
         # Cluster wait before starting
@@ -1144,22 +1162,29 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 seqlen, m_block, split_idx, num_splits
             )
             # A bidirectional entry in a dynamic-causal batch owns a slice of
-            # the full KV range, not the causal range.  This must mirror the
-            # consumer's range calculation exactly: each emitted K/V stage has
-            # a matching consumer wait.
+            # the full KV range, not the causal range; a causal entry of a local
+            # kernel owns its causal window.  This must mirror the consumer's
+            # range calculation exactly: each emitted K/V stage has a matching
+            # consumer wait.
             if const_expr(self._mDynamicCausal is not None):
                 psc = self._mDynamicCausal[batch_idx]
-                if not psc:
-                    n_block_max_full = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
-                    if const_expr(self.is_split_kv):
-                        num_n_blocks_per_split = cute.ceil_div(n_block_max_full, num_splits)
-                        n_block_min = split_idx * num_n_blocks_per_split
-                        n_block_max = cutlass.min(
-                            n_block_min + num_n_blocks_per_split, n_block_max_full
+                if const_expr(self.is_local):
+                    if psc:
+                        n_block_min, n_block_max = self._block_info_causal.get_n_block_min_max(
+                            seqlen, m_block, split_idx, num_splits
                         )
-                    else:
-                        n_block_min = Int32(0)
-                        n_block_max = n_block_max_full
+                else:
+                    if not psc:
+                        n_block_max_full = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
+                        if const_expr(self.is_split_kv):
+                            num_n_blocks_per_split = cute.ceil_div(n_block_max_full, num_splits)
+                            n_block_min = split_idx * num_n_blocks_per_split
+                            n_block_max = cutlass.min(
+                                n_block_min + num_n_blocks_per_split, n_block_max_full
+                            )
+                        else:
+                            n_block_min = Int32(0)
+                            n_block_max = n_block_max_full
 
             # An empty SplitKV partition still needs the same one K and one V
             # pipeline transaction as the consumer's first/last-half sequence.
@@ -1508,20 +1533,30 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         )
                     if const_expr(self._mDynamicCausal is not None):
                         psc_producer = self._mDynamicCausal[batch_idx]
-                        if not psc_producer:
-                            # Mirror the consumer's bidirectional split range so the
-                            # producer loads exactly the K/V blocks the consumer
-                            # processes. Any divergence here deadlocks the pipeline.
-                            n_block_max_full = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
-                            if const_expr(self.is_split_kv):
-                                num_n_blocks_per_split = cute.ceil_div(n_block_max_full, num_splits)
-                                n_block_min = split_idx * num_n_blocks_per_split
-                                n_block_max = cutlass.min(
-                                    n_block_min + num_n_blocks_per_split, n_block_max_full
+                        # Mirror the consumer's range so the producer loads exactly
+                        # the K/V blocks the consumer processes. Any divergence here
+                        # deadlocks the pipeline.
+                        if const_expr(self.is_local):
+                            if psc_producer:
+                                n_block_min, n_block_max = (
+                                    self._block_info_causal.get_n_block_min_max(
+                                        seqlen, m_block, split_idx, num_splits
+                                    )
                                 )
-                            else:
-                                n_block_min = Int32(0)
-                                n_block_max = n_block_max_full
+                        else:
+                            if not psc_producer:
+                                n_block_max_full = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
+                                if const_expr(self.is_split_kv):
+                                    num_n_blocks_per_split = cute.ceil_div(
+                                        n_block_max_full, num_splits
+                                    )
+                                    n_block_min = split_idx * num_n_blocks_per_split
+                                    n_block_max = cutlass.min(
+                                        n_block_min + num_n_blocks_per_split, n_block_max_full
+                                    )
+                                else:
+                                    n_block_min = Int32(0)
+                                    n_block_max = n_block_max_full
                     # Clamp n_block to 0 when n_block_max == 0 (can happen with causal
                     # + pack_gqa when seqlen_k < tile_n). TMA handles n_block=-1
                     # gracefully (fills zeros), but cp.async would crash on
@@ -2136,17 +2171,25 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # The previous code only reset n_block_max to the global max while
                 # leaving n_block_min at its split offset, so splits overlapped and
                 # keys were double-counted -> corrupted softmax (rel_err ~0.33).
-                if not psc:
-                    n_block_max_full = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
-                    if const_expr(self.is_split_kv):
-                        num_n_blocks_per_split = cute.ceil_div(n_block_max_full, num_splits)
-                        n_block_min = split_idx * num_n_blocks_per_split
-                        n_block_max = cutlass.min(
-                            n_block_min + num_n_blocks_per_split, n_block_max_full
+                # A local kernel's static range is already the bidirectional
+                # window; its causal sequences take the zero-right-window range.
+                if const_expr(self.is_local):
+                    if psc:
+                        n_block_min, n_block_max = self._block_info_causal.get_n_block_min_max(
+                            seqlen, m_block, split_idx, num_splits
                         )
-                    else:
-                        n_block_min = Int32(0)
-                        n_block_max = n_block_max_full
+                else:
+                    if not psc:
+                        n_block_max_full = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
+                        if const_expr(self.is_split_kv):
+                            num_n_blocks_per_split = cute.ceil_div(n_block_max_full, num_splits)
+                            n_block_min = split_idx * num_n_blocks_per_split
+                            n_block_max = cutlass.min(
+                                n_block_min + num_n_blocks_per_split, n_block_max_full
+                            )
+                        else:
+                            n_block_min = Int32(0)
+                            n_block_max = n_block_max_full
             # Mirror load_fp8: empty partitions consume a known-valid dummy
             # K/V pair so the pipeline transaction count stays matched.  Their
             # partial result is suppressed before SplitKV combine below.
@@ -2202,8 +2245,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         seqlen, m_block, n_block_min
                     )
                     if const_expr(self._mDynamicCausal is not None):
-                        if not psc:
-                            n_block_min_causal_local_mask = n_block_min
+                        if const_expr(self.is_local):
+                            if psc:
+                                n_block_min_causal_local_mask = (
+                                    self._block_info_causal.get_n_block_min_causal_local_mask(
+                                        seqlen, m_block, n_block_min
+                                    )
+                                )
+                        else:
+                            if not psc:
+                                n_block_min_causal_local_mask = n_block_min
                     # if cute.arch.thread_idx()[0] == 128: cute.printf("n_block_min_causal_local_mask = {}", n_block_min_causal_local_mask)
                     for n_tile in cutlass.range(
                         n_block_max - n_block_min_causal_local_mask, unroll=1
